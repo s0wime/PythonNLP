@@ -1,51 +1,109 @@
 import json
 import spacy
-from spacy.matcher import Matcher, PhraseMatcher
+from spacy import util
+from spacy.matcher import Matcher
 
 nlp = spacy.load("en_core_web_sm")
 
 with open("music.json", "r", encoding="utf-8") as f:
     dialogues = json.load(f)
 
-albums = set()
 user_utterances = []
 for d in dialogues:
     for turn in d['turns']:
         if turn['speaker'] == 'USER':
             user_utterances.append(turn['utterance'])
-        for frame in turn['frames']:
-            for act in frame.get('actions', []):
-                if act.get('slot') == 'album':
-                    for v in act['values']:
-                        albums.add(v)
 
-albums = sorted(albums)
-print(f"Витягнуто {len(user_utterances)} висловлювань користувача")
-print(f"Знайдено {len(albums)} назв альбомів у даних\n")
+print(f"Витягнуто {len(user_utterances)} висловлювань користувача\n")
 
 # =====================================================================
-# 1а) Matcher / PhraseMatcher — виділення назв альбомів
+# 1а) Matcher — виділення назв альбомів за лінгвістичними шаблонами
 # =====================================================================
 print("=" * 60)
-print("1а) Виділення назв альбомів за допомогою PhraseMatcher")
+print("1а) Виділення назв альбомів за допомогою Matcher (шаблони)")
 print("=" * 60)
 
-phrase_matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-album_patterns = [nlp.make_doc(album) for album in albums]
-phrase_matcher.add("ALBUM", album_patterns)
+matcher_albums = Matcher(nlp.vocab)
 
-found_count = 0
+_NO_NAME = ["VERB", "PUNCT", "ADP", "CCONJ", "SCONJ", "PART"]
+
+# Шаблон 1: прийменник + опц. "the" + "album" + назва (1–4 слова)
+# "from the album Born This Way", "in album camila", "on the album Vessel"
+matcher_albums.add("ALBUM_PREP", [[
+    {"LOWER": {"IN": ["on", "in", "from", "off", "for"]}},
+    {"LOWER": "the", "OP": "?"},
+    {"LOWER": "album"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+]])
+
+# Шаблон 2: артикль/присвійний займенник + "album" + назва (1–4 слова)
+# "the album Happiness", "his album Cryptic", "the album My Everything"
+matcher_albums.add("ALBUM_DET", [[
+    {"LOWER": {"IN": ["the", "a", "an", "his", "her", "my", "our", "their"]}},
+    {"LOWER": "album"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"NOT_IN": _NO_NAME}, "IS_ALPHA": True, "OP": "?"},
+]])
+
+# Шаблон 3: "the" + власні іменники з великої літери + "album" (назва перед ключовим словом)
+# "the Built On Glass album", "the Meliora album", "the Visions album"
+matcher_albums.add("ALBUM_NAME_FIRST", [[
+    {"LOWER": "the"},
+    {"IS_TITLE": True},
+    {"IS_TITLE": True, "OP": "?"},
+    {"IS_TITLE": True, "OP": "?"},
+    {"LOWER": "album"},
+]])
+
+# Шаблон 4: "album" без артикля перед власною назвою
+# "album To Whom It May Concern", "album Night Visions", "album camila"
+matcher_albums.add("ALBUM_DIRECT", [[
+    {"LOWER": "album"},
+    {"POS": {"IN": ["PROPN", "NOUN", "ADJ"]}, "IS_ALPHA": True},
+    {"POS": {"IN": ["PROPN", "NOUN", "ADJ", "DET"]}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"IN": ["PROPN", "NOUN", "ADJ", "DET"]}, "IS_ALPHA": True, "OP": "?"},
+    {"POS": {"IN": ["PROPN", "NOUN", "ADJ", "DET"]}, "IS_ALPHA": True, "OP": "?"},
+]])
+
+
+def extract_album_name(doc, span, match_label):
+    for i, token in enumerate(span):
+        if token.lower_ == "album":
+            if match_label == "ALBUM_NAME_FIRST":
+                return doc[span.start + 1 : span.end - 1].text
+            else:
+                name_start = span.start + i + 1
+                if name_start < span.end:
+                    return doc[name_start : span.end].text
+    return span.text
+
+
+found_albums = []
 for utt in user_utterances:
     doc = nlp(utt)
-    matches = phrase_matcher(doc)
-    if matches:
-        for match_id, start, end in matches:
-            span = doc[start:end]
-            print(f"  \"{utt[:80]}{'...' if len(utt)>80 else ''}\"")
-            print(f"    -> Альбом: \"{span.text}\" (позиція {start}-{end})")
-            found_count += 1
+    matches = matcher_albums(doc)
+    if not matches:
+        continue
+    # filter_spans keeps the longest span when matches overlap
+    label_map = {(s, e): nlp.vocab.strings[mid] for mid, s, e in matches}
+    spans = util.filter_spans([doc[s:e] for _, s, e in matches])
+    for span in spans:
+        label = label_map[(span.start, span.end)]
+        album_name = extract_album_name(doc, span, label)
+        found_albums.append((utt, album_name, label))
 
-print(f"\nЗнайдено {found_count} згадок альбомів у висловлюваннях користувача")
+print(f"\nЗнайдено {len(found_albums)} згадок альбомів у висловлюваннях:\n")
+for utt, album, label in found_albums[:25]:
+    print(f"  [{label}] Альбом: \"{album}\"")
+    print(f"    -> \"{utt[:90]}{'...' if len(utt) > 90 else ''}\"")
+    print()
+if len(found_albums) > 25:
+    print(f"  ... та ще {len(found_albums) - 25}")
 
 # =====================================================================
 # 1б) Matcher — висловлювання-підтвердження
